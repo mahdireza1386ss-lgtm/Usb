@@ -713,7 +713,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📞 <b>ارتباط با مدیریت:</b>\n\n"
             "جهت هرگونه سوال، پیشنهاد یا گزارش مشکل به آیدی زیر پیام دهید:\n"
-            "@NAVLINK_1",
+            "@Baran_arj2281",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]]),
             parse_mode='HTML'
         )
