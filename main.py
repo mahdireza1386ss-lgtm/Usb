@@ -27,10 +27,8 @@ ADMIN_IDS = [int(aid.strip()) for aid in os.environ.get("ADMIN_ID", "0").split("
 
 PHONE, OTP, ASK_NAME, ASK_TAG, ASK_SEARCH = range(5)
 
-# محدود کردن Worker ها
 executor = ThreadPoolExecutor(max_workers=5)
 
-# لیست User-Agent های واقعی موبایل
 USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 12; Pixel 6 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
@@ -38,16 +36,34 @@ USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Mobile Safari/537.36"
 ]
 
-def get_anti_bot_headers():
+FIRST_NAMES = ["علی", "محمد", "امیر", "حسین", "رضا", "مهدی", "سجاد", "نیما", "عرفان", "پوریا", "سارا", "مریم", "فاطمه", "زهرا", "الهام", "نرگس", "یلدا", "نگار", "مهسا"]
+LAST_NAMES = ["محمدی", "حسینی", "احمدی", "رضایی", "کریمی", "موسوی", "جعفری", "قاسمی", "حیدری", "صادقی", "مرادی", "رحیمی", "اکبری", "طاهری", "رستمی"]
+
+def clean_digits(text: str) -> str:
+    if not text: return ""
+    return text.translate(str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')).strip()
+
+def get_random_persian_name():
+    return random.choice(FIRST_NAMES), random.choice(LAST_NAMES)
+
+def init_device_session(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['device_id'] = str(uuid.uuid4())
+    context.user_data['session_id'] = str(uuid.uuid4())
+    context.user_data['correlation_id'] = str(uuid.uuid4())
+    context.user_data['user_agent'] = random.choice(USER_AGENTS)
+
+def get_user_headers(context: ContextTypes.DEFAULT_TYPE):
+    if 'device_id' not in context.user_data or 'user_agent' not in context.user_data:
+        init_device_session(context)
     return {
         'accept': 'application/json, text/plain, */*',
         'source': 'okala',
         'ui-version': '2.0',
         'origin': 'https://www.okala.com',
-        'User-Agent': random.choice(USER_AGENTS),
-        'X-User-Unique-Id': str(uuid.uuid4()), 
-        'X-Correlation-Id': str(uuid.uuid4()),
-        'session-id': str(uuid.uuid4())
+        'User-Agent': context.user_data['user_agent'],
+        'X-User-Unique-Id': context.user_data['device_id'],
+        'X-Correlation-Id': context.user_data.get('correlation_id', str(uuid.uuid4())),
+        'session-id': context.user_data['session_id']
     }
 
 def is_admin(user_id):
@@ -84,6 +100,32 @@ def update_tokens_in_data(data, old_acc, new_acc, old_ref, new_ref):
         return json.loads(content)
     except Exception:
         return data
+
+def check_order_history(access_token, headers, proxy_dict=None):
+    """بررسی سوابق سفارش برای حساب‌های دارای نام"""
+    url = "https://apigateway.okala.com/api/voyager/C/Order/GetOrders"
+    req_headers = headers.copy()
+    req_headers['Authorization'] = f"Bearer {access_token}"
+    req_headers['Content-Type'] = 'application/json'
+    payload = {"pageIndex": 1, "pageSize": 5}
+    try:
+        res = requests.post(url, json=payload, headers=req_headers, proxies=proxy_dict, timeout=15)
+        if res.status_code == 200:
+            resp_json = res.json()
+            data = resp_json.get('data', {})
+            if isinstance(data, list):
+                return True, len(data) > 0, len(data)
+            elif isinstance(data, dict):
+                orders = data.get('orders') or data.get('items') or []
+                total_count = data.get('totalCount')
+                if total_count is not None and int(total_count) > 0:
+                    return True, True, int(total_count)
+                return True, len(orders) > 0, len(orders)
+            return True, False, 0
+        return False, False, 0
+    except Exception as e:
+        logging.error(f"Error checking order history: {e}")
+        return False, False, 0
 
 class OkalaAPI:
     def __init__(self):
@@ -146,7 +188,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     api = OkalaAPI()
     ts = int(time.time())
 
-    # بررسی وجود پروکسی
     proxy_check = await get_random_proxy_from_db()
     if not proxy_check:
         await bot.send_message(
@@ -157,7 +198,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             parse_mode='HTML'
         )
 
-    # استخراج لینک‌های ثبت‌شده از لاگ دیتابیس
     raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
     phone_to_latest_link = {}
     for item in raw_logs:
@@ -174,7 +214,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
         parse_mode='HTML'
     )
 
-    # لاگ تفصیلی هر بررسی
     detail_logs = []
 
     def _check_sync(acc_token, ref_token, uid, p_dict, phone):
@@ -182,14 +221,12 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
         log_line = f"[{time.strftime('%H:%M:%S')}] 📱 {phone} | UUID: {uid} | پروکسی: {proxy_ip}\n"
 
         status, res = api.check_discount_api(acc_token, uid, proxy_dict=p_dict)
-        refreshed = False
 
         if status == 401 and ref_token:
             log_line += f"  ♻️ توکن منقضی — در حال رفرش...\n"
             new_acc, new_ref = api.refresh_token(ref_token, proxy_dict=p_dict)
             if new_acc:
                 status, res = api.check_discount_api(new_acc, uid, proxy_dict=p_dict)
-                refreshed = True
                 log_line += f"  ✅ رفرش موفق — بررسی مجدد انجام شد.\n"
                 return status, res, new_acc, new_ref, log_line
             else:
@@ -209,7 +246,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
 
         return status, res, None, None, log_line
 
-    # پردازش اکانت‌ها
     discount_results = []
     done = 0
 
@@ -255,7 +291,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
                     })
 
             done += 1
-            # آپدیت پیشرفت هر ۵ اکانت یا آخرین اکانت
             if done % 5 == 0 or done == total:
                 try:
                     await progress_msg.edit_text(
@@ -271,7 +306,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای کلی برای {key}: {e}\n")
             logging.error(f"Discount check error for {key}: {e}")
 
-    # ساخت گزارش نهایی
     if discount_results:
         report_text = f"🎁 <b>گزارش بررسی تخفیف‌ها ({len(discount_results)} اکانت دارای تخفیف از {total}):</b>\n\n"
         for r in discount_results:
@@ -285,7 +319,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     else:
         report_text = f"➖ <b>هیچ تخفیفی یافت نشد.</b>\nتعداد کل اکانت‌های بررسی‌شده: {total}"
 
-    # ارسال گزارش تخفیف‌ها
     try:
         await progress_msg.delete()
     except Exception:
@@ -304,7 +337,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     except Exception as e:
         logging.error(f"Error sending discount report: {e}")
 
-    # ارسال لاگ تفصیلی
     try:
         full_log = f"=== لاگ بررسی تخفیف | {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
         full_log += f"کل اکانت‌ها: {total} | دارای تخفیف: {len(discount_results)}\n"
@@ -370,7 +402,7 @@ def format_for_injector(auth_data):
     }
 
 # ==========================================
-# پردازش فایل زیپ و بررسی تخفیف
+# پردازش فایل زیپ
 # ==========================================
 async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -505,15 +537,12 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     if vouchers:
                                         discount_count += 1
                                         shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
-                                        
                                         old_link = phone_to_latest_link.get(phone, "لینک قدیمی در دیتابیس یافت نشد")
                                         links_text += f"📱 <b>شماره {phone}:</b>\n{old_link}\n\n"
                                     
                 except Exception as e:
                     api.request_logs.append(f"[{filename}] Exception: {str(e)}\n{'-'*40}\n")
                     
-            debug_logs = api.request_logs
-            
             if discount_count > 0:
                 discount_zip_path = os.path.join(temp_dir, "Discounted_Accounts")
                 await asyncio.to_thread(shutil.make_archive, discount_zip_path, 'zip', discount_dir)
@@ -527,10 +556,6 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(chat_id=user_id, text=links_text, disable_web_page_preview=True, parse_mode='HTML')
             else:
                 await msg.edit_text("⚠️ هیچ‌یک از اکانت‌های موجود دارای تخفیف نبودند.")
-                
-            if debug_logs:
-                debug_out = io.BytesIO("".join(debug_logs).encode('utf-8'))
-                await context.bot.send_document(chat_id=user_id, document=debug_out, filename=f"Discount_Debug_Log_{int(time.time())}.txt", caption="📄 فایل لاگ پاسخ درخواست‌های سرور")
 
 # ==========================================
 # مینی‌سرور وب
@@ -607,7 +632,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚙️ <b>پنل مدیریت سیستم:</b>", reply_markup=get_admin_keyboard(), parse_mode='HTML')
 
 # ==========================================
-# توابع مربوط به برچسب‌گذاری (Tagging) و جستجو
+# توابع مربوط به برچسب‌گذاری و جستجو
 # ==========================================
 async def ask_tag_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
@@ -658,7 +683,7 @@ async def ask_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def receive_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     queries = update.message.text.strip().split('\n')
-    queries = [q.strip() for q in queries if q.strip()]
+    queries = [clean_digits(q.strip()) for q in queries if q.strip()]
     
     msg = await update.message.reply_text("⏳ در حال جستجو در دیتابیس...")
     
@@ -1076,28 +1101,8 @@ async def handle_admin_text_document(update: Update, context: ContextTypes.DEFAU
             await msg.edit_text("❌ خطا در پردازش فایل یا متن پروکسی.")
 
 # ==========================================
-# توابع لاگین کاربر 
+# توابع لاگین کاربر با هویت مستقل دستگاه
 # ==========================================
-def get_user_headers(context: ContextTypes.DEFAULT_TYPE):
-    if 'device_id' not in context.user_data:
-        context.user_data['device_id'] = str(uuid.uuid4())
-        context.user_data['session_id'] = str(uuid.uuid4())
-    headers = {
-        'accept': 'application/json, text/plain, */*',
-        'source': 'okala',
-        'ui-version': '2.0',
-        'origin': 'https://www.okala.com',
-        'User-Agent': random.choice(USER_AGENTS)
-    }
-    headers['X-User-Unique-Id'] = context.user_data['device_id']
-    headers['session-id'] = context.user_data['session_id']
-    return headers
-
-async def async_request(method, url, **kwargs):
-    loop = asyncio.get_running_loop()
-    if method.upper() == 'POST': return await loop.run_in_executor(executor, lambda: requests.post(url, **kwargs))
-    return await loop.run_in_executor(executor, lambda: requests.get(url, **kwargs))
-
 async def check_maintenance(update: Update) -> bool:
     maint = await redis_client.get("settings:maintenance")
     user_id = update.effective_user.id if update.effective_user else 0
@@ -1112,6 +1117,10 @@ async def start_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE
     if await check_maintenance(update): return ConversationHandler.END
     await update.callback_query.answer()
     
+    # تنظیم مشخصات دستگاه کاملاً مستقل برای لاگین جدید
+    init_device_session(context)
+    context.user_data['session_proxy'] = await get_random_proxy_from_db()
+    
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
     await update.callback_query.edit_message_text("📱 <b>لطفاً شماره موبایل خود را وارد کنید:</b>", reply_markup=kb, parse_mode='HTML')
     return PHONE
@@ -1122,24 +1131,48 @@ async def cancel_process_callback(update: Update, context: ContextTypes.DEFAULT_
     await show_main_menu(update, context) 
     return ConversationHandler.END
 
+async def fallback_global_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await core_callback(update, context)
+    return ConversationHandler.END
+
 async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await check_maintenance(update): return ConversationHandler.END
-    phone = update.message.text.strip()
+    phone = clean_digits(update.message.text)
     context.user_data['phone'] = phone
+    
+    # تولید مجدد هویت دستگاه منحصربه‌فرد برای این شماره خاص
+    init_device_session(context)
+    if 'session_proxy' not in context.user_data or not context.user_data['session_proxy']:
+        context.user_data['session_proxy'] = await get_random_proxy_from_db()
+
+    msg = await update.message.reply_text("⏳ در حال ارتباط با سرور و ارسال پیامک...")
     
     url = "https://apigateway.okala.com/api/voyager/C/CustomerAccount/OTPRegister"
     payload = {"mobile": phone, "deviceTypeCode": 7, "confirmTerms": True, "notRobot": False, "otpType": 0, "ValidationCodeCreateReason": 5, "OtpApp": 0, "IsAppOnly": False}
-    response = await async_request('POST', url, json=payload, headers=get_user_headers(context), timeout=15)
+    proxy_dict = context.user_data.get('session_proxy')
+    headers = get_user_headers(context)
     
-    if response.status_code == 200:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")],
-            [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]
-        ])
-        await update.message.reply_text("✉️ <b>کد تایید ارسال شد.</b>\nلطفاً آن را وارد کنید:", reply_markup=kb, parse_mode='HTML')
-        return OTP
-    else:
-        await update.message.reply_text(f"❌ خطا در ارتباط با سیستم: <code>{response.status_code}</code>", parse_mode='HTML')
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            executor,
+            lambda: requests.post(url, json=payload, headers=headers, proxies=proxy_dict, timeout=15)
+        )
+        
+        if response.status_code == 200:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")],
+                [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]
+            ])
+            await msg.edit_text("✉️ <b>کد تایید ارسال شد.</b>\nلطفاً آن را وارد کنید:", reply_markup=kb, parse_mode='HTML')
+            return OTP
+        else:
+            await msg.edit_text(f"❌ خطا در ارسال پیامک: <code>{response.status_code}</code>", parse_mode='HTML')
+            return ConversationHandler.END
+    except Exception as e:
+        logging.error(f"Error in request_otp: {e}")
+        await msg.edit_text("❌ خطا در برقراری ارتباط با سرور. لطفاً مجدداً تلاش کنید.")
         return ConversationHandler.END
 
 async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1149,64 +1182,142 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     url = "https://apigateway.okala.com/api/voyager/C/CustomerAccount/OTPRegister"
     payload = {"mobile": phone, "deviceTypeCode": 7, "confirmTerms": True, "notRobot": False, "otpType": 0, "ValidationCodeCreateReason": 5, "OtpApp": 0, "IsAppOnly": False}
-    response = await async_request('POST', url, json=payload, headers=get_user_headers(context), timeout=15)
-    
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")],
-        [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]
-    ])
-    
-    if response.status_code == 200:
-        await query.edit_message_text(f"✉️ <b>کد تایید مجدداً به {phone} ارسال شد.</b>\nلطفاً کد جدید را وارد کنید:", reply_markup=kb, parse_mode='HTML')
-    else:
-        await query.edit_message_text(f"❌ خطا در ارسال مجدد: <code>{response.status_code}</code>", reply_markup=kb, parse_mode='HTML')
-    return OTP 
-
-async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    otp_code = update.message.text.strip()
-    phone = context.user_data.get('phone')
-    msg = await update.message.reply_text("⏳ در حال پردازش درخواست...")
-    
-    token_url = "https://apigateway.okala.com/api/v1/accounts/tokens"
-    payload = {"mobile_number": phone, "otp_code": otp_code, "grant_type": "customer_grant_type", "client_id": "customer_client_id", "client_secret": "u_M{'57j!%LI21#", "client_name": "customer_client_name", "device_type_code": 7, "scope": "offline_access", "loginDuration": 4815}
+    proxy_dict = context.user_data.get('session_proxy')
     headers = get_user_headers(context)
-    headers["Content-Type"] = "application/x-www-form-urlencoded"
     
-    response = await async_request('POST', token_url, data=payload, headers=headers)
-    
-    if response.status_code == 200:
-        auth_data = response.json()
-        context.user_data['auth_data'] = auth_data 
-        if auth_data.get("access_token"):
-            await redis_client.hset(f"account:{phone}", mapping={"access_token": auth_data.get("access_token"), "refresh_token": auth_data.get("refresh_token")})
-            
-        if not auth_data.get("UserInfo", {}).get("HasName", False):
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
-            await msg.edit_text("⚠️ <b>اطلاعات حساب ناقص است.</b>\nلطفاً نام و نام خانوادگی خود را وارد کنید:", reply_markup=kb, parse_mode='HTML')
-            return ASK_NAME
-        else:
-            return await generate_and_send_link(update, context, msg)
-    else:
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            executor,
+            lambda: requests.post(url, json=payload, headers=headers, proxies=proxy_dict, timeout=15)
+        )
+        
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")],
             [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]
         ])
-        await msg.edit_text("❌ کد وارد شده اشتباه یا منقضی است.\nلطفاً مجدداً تلاش کنید.", reply_markup=kb)
-        return OTP 
+        
+        if response.status_code == 200:
+            await query.edit_message_text(f"✉️ <b>کد تایید مجدداً به {phone} ارسال شد.</b>\nلطفاً کد جدید را وارد کنید:", reply_markup=kb, parse_mode='HTML')
+        else:
+            await query.edit_message_text(f"❌ خطا در ارسال مجدد: <code>{response.status_code}</code>", reply_markup=kb, parse_mode='HTML')
+    except Exception as e:
+        await query.edit_message_text("❌ خطا در اتصال به سرور هنگام ارسال مجدد.")
+        
+    return OTP 
 
-async def save_name_and_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    full_name = update.message.text.strip()
-    if not full_name: return ASK_NAME
-    parts = full_name.split(maxsplit=1)
-    msg = await update.message.reply_text("⏳ در حال ثبت اطلاعات...")
+async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    otp_code = clean_digits(update.message.text)
+    phone = context.user_data.get('phone')
+    msg = await update.message.reply_text("⏳ در حال پردازش درخواست...")
     
-    url = "https://apigateway.okala.com/api/voyager/C/CustomerAccount/UpdateCustomer" 
+    token_url = "https://apigateway.okala.com/api/v1/accounts/tokens"
+    payload = {
+        "mobile_number": phone, 
+        "otp_code": otp_code, 
+        "grant_type": "customer_grant_type", 
+        "client_id": "customer_client_id", 
+        "client_secret": "u_M{'57j!%LI21#", 
+        "client_name": "customer_client_name", 
+        "device_type_code": 7, 
+        "scope": "offline_access", 
+        "loginDuration": 4815
+    }
     headers = get_user_headers(context)
-    headers["Authorization"] = f"Bearer {context.user_data['auth_data'].get('access_token')}"
-    payload = {"birthDate": "", "birthDateEpoch": 700086600, "customerType": 0, "firstName": parts[0], "genderCode": 1, "genderTitle": "مذکر", "lastName": parts[1] if len(parts)>1 else "", "gender": "male"}
+    headers["Content-Type"] = "application/x-www-form-urlencoded"
+    proxy_dict = context.user_data.get('session_proxy')
     
-    await async_request('POST', url, json=payload, headers=headers)
-    return await generate_and_send_link(update, context, msg)
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            executor,
+            lambda: requests.post(token_url, data=payload, headers=headers, proxies=proxy_dict, timeout=15)
+        )
+        
+        if response.status_code == 200:
+            auth_data = response.json()
+            context.user_data['auth_data'] = auth_data 
+            access_token = auth_data.get("access_token")
+            refresh_token = auth_data.get("refresh_token")
+            
+            if access_token:
+                await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
+                
+            has_name = auth_data.get("UserInfo", {}).get("HasName", False)
+            
+            # ۱. اکانت خام است (نیاز به نام دارد) -> نیازی به بررسی سابقه خرید ندارد و نام خودکار وارد می‌شود
+            if not has_name:
+                await msg.edit_text("⚙️ اکانت خام شناسایی شد. در حال تکمیل خودکار مشخصات...")
+                first_name, last_name = get_random_persian_name()
+                update_name_url = "https://apigateway.okala.com/api/voyager/C/CustomerAccount/UpdateCustomer"
+                req_headers = get_user_headers(context)
+                req_headers["Authorization"] = f"Bearer {access_token}"
+                update_payload = {
+                    "birthDate": "", 
+                    "birthDateEpoch": 700086600, 
+                    "customerType": 0, 
+                    "firstName": first_name, 
+                    "genderCode": 1, 
+                    "genderTitle": "مذکر", 
+                    "lastName": last_name, 
+                    "gender": "male"
+                }
+                
+                try:
+                    await loop.run_in_executor(
+                        executor,
+                        lambda: requests.post(update_name_url, json=update_payload, headers=req_headers, proxies=proxy_dict, timeout=15)
+                    )
+                except Exception as e:
+                    logging.error(f"Error auto-setting name: {e}")
+                    
+                if "UserInfo" in auth_data:
+                    auth_data["UserInfo"]["FirstName"] = first_name
+                    auth_data["UserInfo"]["LastName"] = last_name
+                    auth_data["UserInfo"]["HasName"] = True
+                context.user_data['auth_data'] = auth_data
+                
+                return await generate_and_send_link(update, context, msg)
+                
+            # ۲. اکانت از قبل نام دارد -> استعلام سوابق سفارش اکالا
+            else:
+                await msg.edit_text("🔍 در حال بررسی سوابق خرید اکانت...")
+                req_headers = get_user_headers(context)
+                
+                success, has_orders, order_count = await loop.run_in_executor(
+                    executor,
+                    check_order_history, access_token, req_headers, proxy_dict
+                )
+                
+                if has_orders:
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("➕ امتحان خط دیگر", callback_data="user_login")],
+                        [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]
+                    ])
+                    await msg.edit_text(
+                        f"⛔️ <b>عملیات لغو شد!</b>\n\n"
+                        f"📱 شماره <code>{phone}</code> <b>دارای سابقه خرید قبلی</b> در سیستم است (تعداد سفارش: {order_count}).\n\n"
+                        f"⚠️ طبق دستورالعمل، برای اکانت‌های دارای سفارش لینکی تولید نمی‌شود.",
+                        reply_markup=kb,
+                        parse_mode='HTML'
+                    )
+                    return ConversationHandler.END
+                else:
+                    return await generate_and_send_link(update, context, msg)
+                    
+        else:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")],
+                [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]
+            ])
+            await msg.edit_text("❌ کد وارد شده اشتباه یا منقضی است.\nلطفاً مجدداً تلاش کنید.", reply_markup=kb)
+            return OTP 
+            
+    except Exception as e:
+        logging.error(f"Error in verify_otp: {e}")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
+        await msg.edit_text("❌ خطا در برقراری ارتباط با سرور. لطفاً مجدداً تلاش کنید.", reply_markup=kb)
+        return OTP
 
 async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_TYPE, status_msg) -> int:
     auth_data = context.user_data.get('auth_data')
@@ -1289,9 +1400,6 @@ async def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, verify_otp_and_check_name),
                 CallbackQueryHandler(resend_otp_callback, pattern="^resend_otp$"),
             ],
-            ASK_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_name_and_continue),
-            ],
             ASK_TAG: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_tag_name),
                 CallbackQueryHandler(clear_active_tag_callback, pattern="^clear_active_tag$")
@@ -1302,12 +1410,13 @@ async def main():
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
-            CallbackQueryHandler(cancel_process_callback, pattern="^cancel_action$")
+            CallbackQueryHandler(cancel_process_callback, pattern="^cancel_action$"),
+            CallbackQueryHandler(fallback_global_callback, pattern="^admin_|^set_exp_|^main_menu$|^admin_panel$\vert{}^finish_link_creation$|^my_tags$\vert{}^show_tag_\vert{}^contact_admin$")
         ]
     )
     application.add_handler(conv_handler)
     
-    application.add_handler(CallbackQueryHandler(core_callback, pattern="^admin_|^set_exp_|^main_menu$|^admin_panel$|^finish_link_creation$|^my_tags$|^show_tag_|^contact_admin$"))
+    application.add_handler(CallbackQueryHandler(core_callback, pattern="^admin_|^set_exp_|^main_menu$|^admin_panel$\vert{}^finish_link_creation$|^my_tags$\vert{}^show_tag_\vert{}^contact_admin$"))
     
     application.add_handler(MessageHandler(filters.TEXT | filters.Document.FileExtension("txt"), handle_admin_text_document))
 
