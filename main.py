@@ -67,6 +67,8 @@ def get_user_headers(context: ContextTypes.DEFAULT_TYPE):
     }
 
 def is_admin(user_id):
+    if not ADMIN_IDS or ADMIN_IDS == [0]:
+        return True
     return user_id in ADMIN_IDS
 
 # ==========================================
@@ -102,7 +104,7 @@ def update_tokens_in_data(data, old_acc, new_acc, old_ref, new_ref):
         return data
 
 def check_order_history(access_token, headers, proxy_dict=None):
-    """بررسی سوابق سفارش برای حساب‌های دارای نام"""
+    """بررسی دقیق سوابق سفارش با کنترل خطای شبکه"""
     url = "https://apigateway.okala.com/api/voyager/C/Order/GetOrders"
     req_headers = headers.copy()
     req_headers['Authorization'] = f"Bearer {access_token}"
@@ -112,7 +114,7 @@ def check_order_history(access_token, headers, proxy_dict=None):
         res = requests.post(url, json=payload, headers=req_headers, proxies=proxy_dict, timeout=15)
         if res.status_code == 200:
             resp_json = res.json()
-            data = resp_json.get('data', {})
+            data = resp_json.get('data') or {}
             if isinstance(data, list):
                 return True, len(data) > 0, len(data)
             elif isinstance(data, dict):
@@ -360,7 +362,7 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
 def format_for_injector(auth_data):
     access_token = auth_data.get("access_token", "")
     refresh_token = auth_data.get("refresh_token", "")
-    user_info = auth_data.get("UserInfo", {})
+    user_info = auth_data.get("UserInfo") or {}
     
     user_dict = {
         "id": user_info.get("Id", 0), "alternativeId": user_info.get("AlternativeId", ""), "alternativeCustomerId": user_info.get("AlternativeCustomerId", 0),
@@ -537,12 +539,15 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     if vouchers:
                                         discount_count += 1
                                         shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
+                                        
                                         old_link = phone_to_latest_link.get(phone, "لینک قدیمی در دیتابیس یافت نشد")
                                         links_text += f"📱 <b>شماره {phone}:</b>\n{old_link}\n\n"
                                     
                 except Exception as e:
                     api.request_logs.append(f"[{filename}] Exception: {str(e)}\n{'-'*40}\n")
                     
+            debug_logs = api.request_logs
+            
             if discount_count > 0:
                 discount_zip_path = os.path.join(temp_dir, "Discounted_Accounts")
                 await asyncio.to_thread(shutil.make_archive, discount_zip_path, 'zip', discount_dir)
@@ -556,6 +561,10 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(chat_id=user_id, text=links_text, disable_web_page_preview=True, parse_mode='HTML')
             else:
                 await msg.edit_text("⚠️ هیچ‌یک از اکانت‌های موجود دارای تخفیف نبودند.")
+                
+            if debug_logs:
+                debug_out = io.BytesIO("".join(debug_logs).encode('utf-8'))
+                await context.bot.send_document(chat_id=user_id, document=debug_out, filename=f"Discount_Debug_Log_{int(time.time())}.txt", caption="📄 فایل لاگ پاسخ درخواست‌های سرور")
 
 # ==========================================
 # مینی‌سرور وب
@@ -827,7 +836,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(report_text, disable_web_page_preview=True, parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="my_tags")]]))
         return
 
-    # === بخش مربوط به مدیریت ادمین ===
+    # === بخش مدیریت ادمین ===
     if not is_admin(user_id): return
     await query.answer()
     
@@ -1117,7 +1126,6 @@ async def start_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE
     if await check_maintenance(update): return ConversationHandler.END
     await update.callback_query.answer()
     
-    # تنظیم مشخصات دستگاه کاملاً مستقل برای لاگین جدید
     init_device_session(context)
     context.user_data['session_proxy'] = await get_random_proxy_from_db()
     
@@ -1141,10 +1149,8 @@ async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     phone = clean_digits(update.message.text)
     context.user_data['phone'] = phone
     
-    # تولید مجدد هویت دستگاه منحصربه‌فرد برای این شماره خاص
     init_device_session(context)
-    if 'session_proxy' not in context.user_data or not context.user_data['session_proxy']:
-        context.user_data['session_proxy'] = await get_random_proxy_from_db()
+    context.user_data['session_proxy'] = await get_random_proxy_from_db()
 
     msg = await update.message.reply_text("⏳ در حال ارتباط با سرور و ارسال پیامک...")
     
@@ -1168,7 +1174,7 @@ async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             await msg.edit_text("✉️ <b>کد تایید ارسال شد.</b>\nلطفاً آن را وارد کنید:", reply_markup=kb, parse_mode='HTML')
             return OTP
         else:
-            await msg.edit_text(f"❌ خطا در ارسال پیامک: <code>{response.status_code}</code>", parse_mode='HTML')
+            await msg.edit_text(f"❌ خطا در ارسال پیامک: <code>{response.status_code}</code>\nلطفاً دوباره امتحان کنید.", parse_mode='HTML')
             return ConversationHandler.END
     except Exception as e:
         logging.error(f"Error in request_otp: {e}")
@@ -1202,7 +1208,8 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await query.edit_message_text(f"❌ خطا در ارسال مجدد: <code>{response.status_code}</code>", reply_markup=kb, parse_mode='HTML')
     except Exception as e:
-        await query.edit_message_text("❌ خطا در اتصال به سرور هنگام ارسال مجدد.")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
+        await query.edit_message_text("❌ خطا در اتصال به سرور هنگام ارسال مجدد.", reply_markup=kb)
         
     return OTP 
 
@@ -1243,11 +1250,12 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
             if access_token:
                 await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
                 
-            has_name = auth_data.get("UserInfo", {}).get("HasName", False)
+            user_info = auth_data.get("UserInfo") or {}
+            has_name = user_info.get("HasName", False)
             
-            # ۱. اکانت خام است (نیاز به نام دارد) -> نیازی به بررسی سابقه خرید ندارد و نام خودکار وارد می‌شود
+            # ۱. اکانت خام است (نام ندارد) -> نیازی به استعلام خرید ندارد؛ نام رندوم وارد شده و لینک صادر می‌شود
             if not has_name:
-                await msg.edit_text("⚙️ اکانت خام شناسایی شد. در حال تکمیل خودکار مشخصات...")
+                await msg.edit_text("⚙️ اکانت خام است. در حال ثبت خودکار نام و نام خانوادگی...")
                 first_name, last_name = get_random_persian_name()
                 update_name_url = "https://apigateway.okala.com/api/voyager/C/CustomerAccount/UpdateCustomer"
                 req_headers = get_user_headers(context)
@@ -1271,15 +1279,16 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
                 except Exception as e:
                     logging.error(f"Error auto-setting name: {e}")
                     
-                if "UserInfo" in auth_data:
-                    auth_data["UserInfo"]["FirstName"] = first_name
-                    auth_data["UserInfo"]["LastName"] = last_name
-                    auth_data["UserInfo"]["HasName"] = True
+                if not auth_data.get("UserInfo"):
+                    auth_data["UserInfo"] = {}
+                auth_data["UserInfo"]["FirstName"] = first_name
+                auth_data["UserInfo"]["LastName"] = last_name
+                auth_data["UserInfo"]["HasName"] = True
                 context.user_data['auth_data'] = auth_data
                 
                 return await generate_and_send_link(update, context, msg)
                 
-            # ۲. اکانت از قبل نام دارد -> استعلام سوابق سفارش اکالا
+            # ۲. اکانت از قبل نام دارد -> استعلام سفارشات ثبت‌شده
             else:
                 await msg.edit_text("🔍 در حال بررسی سوابق خرید اکانت...")
                 req_headers = get_user_headers(context)
@@ -1289,6 +1298,11 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
                     check_order_history, access_token, req_headers, proxy_dict
                 )
                 
+                if not success:
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
+                    await msg.edit_text("⚠️ خطا در بررسی سابقه خرید اکانت از سمت سرور. لطفاً مجدداً امتحان کنید.", reply_markup=kb)
+                    return OTP
+                
                 if has_orders:
                     kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton("➕ امتحان خط دیگر", callback_data="user_login")],
@@ -1297,7 +1311,7 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
                     await msg.edit_text(
                         f"⛔️ <b>عملیات لغو شد!</b>\n\n"
                         f"📱 شماره <code>{phone}</code> <b>دارای سابقه خرید قبلی</b> در سیستم است (تعداد سفارش: {order_count}).\n\n"
-                        f"⚠️ طبق دستورالعمل، برای اکانت‌های دارای سفارش لینکی تولید نمی‌شود.",
+                        f"⚠️ طبق تنظیمات، برای خطوط دارای سفارش لینکی ساخته نمی‌شود.",
                         reply_markup=kb,
                         parse_mode='HTML'
                     )
